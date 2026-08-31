@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+import random
 from pathlib import Path
 from typing import Optional
 import xml.dom.minidom
@@ -25,6 +26,7 @@ except ImportError:
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import tkinter.font as tkfont
+from html.parser import HTMLParser
 
 # Constants
 PREFERENCES_FILE = "preferences.json"
@@ -34,6 +36,7 @@ DEFAULT_WIDTH = 1400
 DEFAULT_HEIGHT = 1050
 DEFAULT_FONT = "Arial"
 DEFAULT_FONT_SIZE = "11"
+TOTAL_VERSES = 6348  # Canonical total verses for coverage calculations
 
 # Set up basic logging to console
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -49,6 +52,22 @@ xml_default_path = os.path.join(base_path, "ia_all.xml")
 # =====================================================================
 # UTILITIES
 # =====================================================================
+
+def generate_translation_colors(translations: list) -> dict:
+    """Generate unique colors for each translation."""
+    # Predefined color palette (vibrant, distinct colors)
+    colors_palette = [
+        "#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", "#98D8C8",
+        "#F7DC6F", "#BB8FCE", "#85C1E2", "#F8B88B", "#52C9D9",
+        "#F06292", "#AB47BC", "#29B6F6", "#26C6DA", "#66BB6A",
+        "#FFA726", "#EF5350", "#7E57C2", "#5C6BC0", "#42A5F5"
+    ]
+    
+    color_map = {}
+    for i, trans in enumerate(translations):
+        color_map[trans] = colors_palette[i % len(colors_palette)]
+    return color_map
+
 
 class ToolTip:
     """A robust tooltip class constrained within the application window."""
@@ -294,7 +313,12 @@ class PreferencesModel:
             "broad_search": False,
             "broad_results": False,
             "notes_enabled": False,
-            "tooltips_enabled": True
+            "tooltips_enabled": True,
+            "translation_colors": {},
+            "presets": {
+                "Default": ["Arabic", "Muhammad Asad"]
+            },
+            "active_preset": "Default"
         }
 
         if not os.path.exists(self.filename):
@@ -330,11 +354,36 @@ class PreferencesModel:
         except Exception as e:
             logging.error(f"Failed to save preferences: {e}")
 
+    def get_preset_names(self):
+        """Returns list of available preset names."""
+        return list(self.data.get("presets", {}).keys())
+
+    def get_preset(self, preset_name):
+        """Returns list of translations for a preset."""
+        return self.data.get("presets", {}).get(preset_name, [])
+
+    def save_preset(self, preset_name, translations):
+        """Saves or updates a preset with given translations."""
+        if "presets" not in self.data:
+            self.data["presets"] = {}
+        self.data["presets"][preset_name] = translations
+        self.data["active_preset"] = preset_name
+        self.save_preferences()
+
+    def delete_preset(self, preset_name):
+        """Deletes a preset."""
+        if "presets" in self.data and preset_name in self.data["presets"]:
+            del self.data["presets"][preset_name]
+            if self.data.get("active_preset") == preset_name:
+                self.data["active_preset"] = list(self.data["presets"].keys())[0] if self.data["presets"] else "Default"
+            self.save_preferences()
+
 
 class QuranModel:
     """Handles parsing and storage of Quran XML corpus and User Notes XML."""
     def __init__(self):
         self.translations = []
+        self.translation_meta = {}  # metadata for translations (language/group if present)
         self.surahs = {}
         self.verses = {}
         self.surah_names = {}
@@ -349,6 +398,11 @@ class QuranModel:
             for _, elem in context:
                 try:
                     source = elem.get('Source')
+                    # Detect language/group metadata if present on the Rendition element
+                    lang_meta = elem.get('Language') or elem.get('Group') or elem.get('Lang') or elem.get('language')
+                    if lang_meta:
+                        self.translation_meta[source] = lang_meta
+
                     text = html.unescape(elem.text.strip()) if elem.text else ""
                     ayah_elem = elem.getparent()
                     surah_elem = ayah_elem.getparent()
@@ -458,6 +512,50 @@ class QuranModel:
             logging.info("Saved notes.xml successfully.")
         except Exception as e:
             logging.error(f"Failed to write notes.xml: {e}")
+
+    def get_translation_statistics(self):
+        """Returns aggregated statistics about available translations.
+        Groups: Arabic, Transliteration, Other (English/other languages).
+        Uses a threshold of 6235 verses to classify as 'full'.
+        Also attempts to use language metadata from XML when available.
+        """
+        THRESHOLD_FULL = 6235
+        stats = {
+            'total_translations': len(self.translations),
+            'arabic': {'total': 0, 'full': 0, 'partial': 0},
+            'transliteration': {'total': 0, 'full': 0, 'partial': 0},
+            'other': {'total': 0, 'full': 0, 'partial': 0}
+        }
+
+        for trans in self.translations:
+            # Count how many verses have this translation
+            count = 0
+            for surah_num in self.verses:
+                for ayah_num in self.verses[surah_num]:
+                    if trans in self.verses[surah_num][ayah_num]:
+                        count += 1
+
+            is_full = (count >= THRESHOLD_FULL)
+            is_partial = (0 < count < THRESHOLD_FULL)
+
+            # Classify using metadata when available, otherwise fall back to name heuristics
+            meta = self.translation_meta.get(trans, '').lower() if trans else ''
+            lname = trans.lower() if trans else ''
+
+            if trans == 'Arabic' or ('arabic' in meta) or ('arabic' in lname and 'transliteration' not in lname):
+                grp = 'arabic'
+            elif ('transliteration' in meta) or ('transliteration' in lname):
+                grp = 'transliteration'
+            else:
+                grp = 'other'
+
+            stats[grp]['total'] += 1
+            if is_full:
+                stats[grp]['full'] += 1
+            elif is_partial:
+                stats[grp]['partial'] += 1
+
+        return stats
 
 
 # =====================================================================
@@ -1010,6 +1108,9 @@ class QuranView:
         self.broad_results_var = tk.BooleanVar(value=pref_data.get('broad_results', False))
         self.notes_var = tk.BooleanVar(value=pref_data.get('notes_enabled', False))
         self.tooltips_var = tk.BooleanVar(value=pref_data.get('tooltips_enabled', True))
+        self.random_verse_var = tk.BooleanVar(value=pref_data.get('random_verse_colors', False))
+        # Reading mode toggle persisted in preferences
+        self.reading_mode_var = tk.BooleanVar(value=pref_data.get('reading_mode', False))
 
         self.available_fonts = sorted(list(tkfont.families()))
         self.font_sizes = [str(size) for size in range(4, 37)]
@@ -1073,6 +1174,8 @@ class QuranView:
             prefs['font'] = self.current_font.get()
             prefs['font_size'] = self.current_font_size.get()
             prefs['theme'] = self.theme_var.get()
+            prefs['random_verse_colors'] = self.random_verse_var.get()
+            prefs['reading_mode'] = self.reading_mode_var.get()
             prefs['last_keyword'] = self.keyword_var.get()
 
             self.controller.prefs_model.save_preferences()
@@ -1098,27 +1201,33 @@ class QuranView:
         self.left_frame.grid_rowconfigure(2, weight=1)
         self.left_frame.grid_columnconfigure(0, weight=1)
 
-        # Preset Frame on Row 0
+        # Preset Frame on Row 0 - Dropdown system for named presets
         self.preset_frame = tk.Frame(self.left_frame, bg=colors['bg'])
         self.preset_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-        for i in range(4):
-            self.preset_frame.grid_columnconfigure(i, weight=1)
+        for i in range(4):  # 4 columns: label, dropdown, add button, delete button
+            self.preset_frame.grid_columnconfigure(i, weight=1 if i == 1 else 0)
 
-        self.save_preset_btn = tk.Button(self.preset_frame, text="Save", command=self.save_favorites_preset,
-                                         bg=colors['button_bg'], fg=colors['button_fg'])
-        self.save_preset_btn.grid(row=0, column=0, sticky="ew", padx=2)
 
-        self.load_preset_btn = tk.Button(self.preset_frame, text="Load Saved", command=self.load_favorites_preset,
-                                         bg=colors['button_bg'], fg=colors['button_fg'])
-        self.load_preset_btn.grid(row=0, column=1, sticky="ew", padx=2)
+        # Preset label
+        tk.Label(self.preset_frame, text="Preset:", bg=colors['bg'], fg=colors['fg']).grid(row=0, column=1, sticky="w", padx=2)
 
-        self.all_btn = tk.Button(self.preset_frame, text="All", command=self.select_all_translations,
-                                 bg=colors['button_bg'], fg=colors['button_fg'])
-        self.all_btn.grid(row=0, column=2, sticky="ew", padx=2)
+        # Preset dropdown
+        preset_names = self.controller.prefs_model.get_preset_names()
+        self.preset_var = tk.StringVar(value=self.controller.prefs_model.data.get('active_preset', 'Default'))
+        self.preset_combo = ttk.Combobox(self.preset_frame, textvariable=self.preset_var, 
+                                         values=preset_names, state="readonly", style="MyCombo.TCombobox")
+        self.preset_combo.grid(row=0, column=2, sticky="ew", padx=2)
+        self.preset_combo.bind("<<ComboboxSelected>>", self.load_preset_from_dropdown)
 
-        self.clear_btn = tk.Button(self.preset_frame, text="Clear", command=self.clear_all_translations,
-                                   bg=colors['button_bg'], fg=colors['button_fg'])
-        self.clear_btn.grid(row=0, column=3, sticky="ew", padx=2)
+        # Add preset button (plus icon)
+        self.add_preset_btn = tk.Button(self.preset_frame, text="+", command=self.add_new_preset,
+                                        bg=colors['button_bg'], fg=colors['button_fg'], width=3)
+        self.add_preset_btn.grid(row=0, column=3, sticky="e", padx=2)
+
+        # Delete preset button (minus icon)
+        self.delete_preset_btn = tk.Button(self.preset_frame, text="−", command=self.delete_current_preset,
+                                           bg=colors['button_bg'], fg=colors['button_fg'], width=3)
+        self.delete_preset_btn.grid(row=0, column=4, sticky="e", padx=2)
 
         # Filter Frame on Row 1
         self.filter_frame = tk.Frame(self.left_frame, bg=colors['bg'])
@@ -1130,6 +1239,17 @@ class QuranView:
         self.filter_entry = tk.Entry(self.filter_frame, textvariable=self.filter_var,
                                      bg=colors['entry_bg'], fg=colors['fg'], insertbackground=colors['fg'])
         self.filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # Select/Deselect All toggle beside filter
+        self.select_all_state = False
+        self.select_all_btn = tk.Button(self.filter_frame, text="All", width=6, command=self.toggle_select_all,
+                                        bg=colors['button_bg'], fg=colors['button_fg'])
+        self.select_all_btn.pack(side=tk.RIGHT, padx=5)
+
+        self.show_selected_translators_only = False
+        self.eye_btn = tk.Button(self.filter_frame, text="👁", width=3, command=self.toggle_translator_visibility,
+                                 bg=colors['button_bg'], fg=colors['button_fg'])
+        self.eye_btn.pack(side=tk.RIGHT, padx=2)
 
         # Canvas scroll frame for checklists on Row 2
         self.canvas = tk.Canvas(self.left_frame, bg=colors['bg'], highlightthickness=0)
@@ -1149,15 +1269,27 @@ class QuranView:
             widget.bind("<Button-4>", self.on_canvas_mousewheel)
             widget.bind("<Button-5>", self.on_canvas_mousewheel)
 
-        # Populate translation checklists
+        # Populate translation checklists with colors
         self.translation_vars.clear()
         self.translation_checkbuttons.clear()
+        
+        # Initialize translation colors if not already present
+        if not self.controller.prefs_model.data.get('translation_colors'):
+            self.controller.prefs_model.data['translation_colors'] = generate_translation_colors(
+                self.controller.quran_model.translations
+            )
+            self.controller.prefs_model.save_preferences()
+        
+        trans_colors = self.controller.prefs_model.data.get('translation_colors', {})
+        
         selected_prefs = self.controller.prefs_model.data.get('selected_translations', [])
         for i, trans in enumerate(self.controller.quran_model.translations):
             var = tk.BooleanVar(value=trans in selected_prefs)
+            # Use the translation's color for the checkbox text
+            trans_color = trans_colors.get(trans, colors['fg'])
             cb = tk.Checkbutton(self.scrollable_frame, text=trans, variable=var,
-                                bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'],
-                                command=self.trigger_search)
+                                bg=colors['bg'], fg=trans_color, selectcolor=colors['selectbg'],
+                                command=self.on_translation_toggled)
             cb.grid(row=i, column=0, sticky="w", padx=2, pady=0)
             cb.bind("<MouseWheel>", self.on_canvas_mousewheel)
             cb.bind("<Button-4>", self.on_canvas_mousewheel)
@@ -1165,6 +1297,13 @@ class QuranView:
             
             self.translation_vars[trans] = var
             self.translation_checkbuttons[trans] = cb
+
+        # Ensure canvas scroll region covers all checkbuttons
+        try:
+            self.canvas.update_idletasks()
+            self.canvas.configure(scrollregion=self.canvas.bbox("all") or (0, 0, 300, 400))
+        except Exception:
+            pass
 
         # Right Split frame (Search toolbar + Results area)
         self.right_frame = tk.Frame(self.main_container, bg=colors['bg'])
@@ -1180,10 +1319,22 @@ class QuranView:
         self.top_frame = tk.Frame(self.search_frame, bg=colors['bg'])
         self.top_frame.pack(fill=tk.X)
 
-        tk.Label(self.top_frame, text="Surah.Verse-Range:\n(e.g., 36, 1-114, 2.255-27.30)",
-                 bg=colors['bg'], fg=colors['fg']).pack(side=tk.LEFT, padx=5)
+        # Sidebar toggle (moved to top so it remains visible even when sidebar is hidden)
+        self.sidebar_visible = True
+        self.sidebar_toggle_btn = tk.Button(self.top_frame, text='☰', width=3, command=self.toggle_sidebar,
+                                          bg=colors['button_bg'], fg=colors['button_fg'])
+        self.sidebar_toggle_btn.pack(side=tk.LEFT, padx=2)
 
-        # Navigation controls
+        self.range_label = tk.Label(self.top_frame, text="Surah.Verse-Range:\n(e.g., 36, 1-114, 2.255-27.30)",
+                bg=colors['bg'], fg=colors['fg'])
+        self.range_label.pack(side=tk.LEFT, padx=5)
+        self.range_label.bind("<Button-1>", lambda e: self.show_surah_reference_popup())
+
+        # Navigation controls (First, Prev, Ref Entry, Next, Last)
+        self.navigate_first_btn = tk.Button(self.top_frame, text="<<", command=self.navigate_first, width=3,
+                                            bg=colors['button_bg'], fg=colors['button_fg'])
+        self.navigate_first_btn.pack(side=tk.LEFT, padx=2)
+
         self.navigate_prev_btn = tk.Button(self.top_frame, text="<", command=self.navigate_previous, width=2,
                                            bg=colors['button_bg'], fg=colors['button_fg'])
         self.navigate_prev_btn.pack(side=tk.LEFT, padx=2)
@@ -1198,9 +1349,14 @@ class QuranView:
                                            bg=colors['button_bg'], fg=colors['button_fg'])
         self.navigate_next_btn.pack(side=tk.LEFT, padx=2)
 
+        self.navigate_last_btn = tk.Button(self.top_frame, text=">>", command=self.navigate_last, width=3,
+                                           bg=colors['button_bg'], fg=colors['button_fg'])
+        self.navigate_last_btn.pack(side=tk.LEFT, padx=2)
+
         self.show_verses_btn = tk.Button(self.top_frame, text="Show Verses", command=self.trigger_search,
                                          bg=colors['button_bg'], fg=colors['button_fg'])
         self.show_verses_btn.pack(side=tk.LEFT, padx=5)
+
 
         self.copy_all_btn = tk.Button(self.top_frame, text="Copy", command=self.copy_all_results_to_clipboard,
                                       bg=colors['button_bg'], fg=colors['button_fg'])
@@ -1225,34 +1381,28 @@ class QuranView:
         self.broad_search_var.trace_add('write', self.toggle_broad_results_interactive)
         self.toggle_broad_results_interactive()
 
-        # Toolbar Frame Font / Theme Selector
+        # Toolbar Frame: Settings and status
         self.font_frame = tk.Frame(self.search_frame, bg=colors['bg'])
         self.font_frame.pack(fill=tk.X, pady=2)
 
-        tk.Label(self.font_frame, text="Font:", bg=colors['bg'], fg=colors['fg']).pack(side=tk.LEFT, padx=5)
-        self.font_combo = ttk.Combobox(self.font_frame, textvariable=self.current_font,
-                                       values=self.available_fonts, state="readonly", style="MyCombo.TCombobox")
-        self.font_combo.pack(side=tk.LEFT, padx=5)
-        self.font_combo.bind("<<ComboboxSelected>>", self.update_active_font)
-        self.font_combo.bind("<Leave>", lambda e: self.font_combo.selection_clear())
+        # Settings button (opens dialog with Font/Size/Theme/Customize/Tips)
+        self.settings_btn = tk.Button(self.font_frame, text="Settings", command=self.open_settings_dialog,
+                                      bg=colors['button_bg'], fg=colors['button_fg'])
+        self.settings_btn.pack(side=tk.LEFT, padx=5)
 
-        tk.Label(self.font_frame, text="Size:", bg=colors['bg'], fg=colors['fg']).pack(side=tk.LEFT, padx=5)
-        self.size_combo = ttk.Combobox(self.font_frame, textvariable=self.current_font_size,
-                                       values=self.font_sizes, state="readonly", style="MyCombo.TCombobox")
-        self.size_combo.pack(side=tk.LEFT, padx=5)
-        self.size_combo.bind("<<ComboboxSelected>>", self.update_active_font)
-        self.size_combo.bind("<Leave>", lambda e: self.size_combo.selection_clear())
-
-        tk.Label(self.font_frame, text="Theme:", bg=colors['bg'], fg=colors['fg']).pack(side=tk.LEFT, padx=5)
-        self.theme_combo = ttk.Combobox(self.font_frame, textvariable=self.theme_var,
-                                        values=list(self.controller.theme_model.themes.keys()), state="readonly", style="MyCombo.TCombobox")
-        self.theme_combo.pack(side=tk.LEFT, padx=5)
-        self.theme_combo.bind("<<ComboboxSelected>>", self.apply_visual_theme)
-        self.theme_combo.bind("<Leave>", lambda e: self.theme_combo.selection_clear())
-
-        self.customize_btn = tk.Button(self.font_frame, text="Customize", command=self.open_custom_theme_editor,
-                  bg=colors['button_bg'], fg=colors['button_fg'])
-        self.customize_btn.pack(side=tk.LEFT, padx=5)
+        # Legacy widgets kept as hidden placeholders to maintain tooltips and theme bindings
+        # (moved into Settings dialog, but some code still expects these attributes)
+        self.font_combo = ttk.Combobox(self.font_frame, values=self.available_fonts, state='readonly', style="MyCombo.TCombobox")
+        self.size_combo = ttk.Combobox(self.font_frame, values=self.font_sizes, state='readonly', width=8)
+        self.theme_combo = ttk.Combobox(self.font_frame, values=list(self.controller.theme_model.themes.keys()), state='readonly', style="MyCombo.TCombobox")
+        self.customize_btn = tk.Button(self.font_frame, text="Customize", command=self.open_custom_theme_editor)
+        self.tooltips_checkbox = tk.Checkbutton(self.font_frame, text="Tips", variable=self.tooltips_var)
+        # Keep them present for theming/tooltips but hidden in the toolbar
+        self.font_combo.pack_forget()
+        self.size_combo.pack_forget()
+        self.theme_combo.pack_forget()
+        self.customize_btn.pack_forget()
+        self.tooltips_checkbox.pack_forget()
 
         self.status_var = tk.StringVar(value="Ready")
         self.status_label = tk.Label(self.font_frame, textvariable=self.status_var, bg=colors['bg'], fg=colors['fg'])
@@ -1262,10 +1412,6 @@ class QuranView:
                                              bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'],
                                              command=self.toggle_notes_pane)
         self.notes_checkbox.pack(side=tk.RIGHT, padx=5)
-
-        self.tooltips_checkbox = tk.Checkbutton(self.font_frame, text="Tips", variable=self.tooltips_var,
-                                                bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'])
-        self.tooltips_checkbox.pack(side=tk.RIGHT, padx=5)
 
         # Primary Results Box Frame
         self.result_frame = tk.Frame(self.right_frame, bg=colors['bg'], relief=tk.FLAT, bd=0)
@@ -1298,10 +1444,9 @@ class QuranView:
 # tooltips
 
         # Bind Tooltips to Left Frame Preset Buttons
-        ToolTip(self.save_preset_btn, "Save your currently selected translations", self.tooltips_var)
-        ToolTip(self.load_preset_btn, "Restore your saved translations", self.tooltips_var)
-        ToolTip(self.all_btn, "Select all translations", self.tooltips_var)
-        ToolTip(self.clear_btn, "Deselect all translations", self.tooltips_var)
+        ToolTip(self.add_preset_btn, "Save current selection as a new preset", self.tooltips_var)
+        ToolTip(self.delete_preset_btn, "Delete the current preset", self.tooltips_var)
+        ToolTip(self.preset_combo, "Select a saved preset to load", self.tooltips_var)
         # Bind Tooltips to Toolbar Controls
         ToolTip(self.ref_entry, "Type numbers here then press 'Enter' on keyboard\n\nTIP: Double-click inside this box to set range to 1-114", self.tooltips_var)
         ToolTip(self.keyword_entry, "Type query here then press 'Enter' on keyboard\n\nDouble-click inside this box to show the help guide", self.tooltips_var)
@@ -1311,6 +1456,7 @@ class QuranView:
         ToolTip(self.tooltips_checkbox, "Enable/Disable floating tooltips (like this one)", self.tooltips_var)
         # Filter
         ToolTip(self.filter_entry, "Type here to filter the below translators list\n\nTIP:\nAfter typing...\nKeyboard 'TAB' to highlight a translation\n(or Shift-Tab to move up)\n& 'Spacebar' to select/deselect", self.tooltips_var)
+        ToolTip(self.eye_btn, "Toggle translator list: show all names, or only selected ones", self.tooltips_var)
         # Navigation
         ToolTip(self.navigate_prev_btn, "Navigate to the previous verse", self.tooltips_var)
         ToolTip(self.navigate_next_btn, "Navigate to the next verse", self.tooltips_var)
@@ -1326,6 +1472,12 @@ class QuranView:
    
         self.apply_visual_theme()
 
+        # Key bindings for quick navigation
+        self.root.bind('<Left>', lambda e: self.navigate_previous())
+        self.root.bind('<Right>', lambda e: self.navigate_next())
+        self.root.bind('<Home>', lambda e: self.navigate_first())
+        self.root.bind('<End>', lambda e: self.navigate_last())
+
         # Render Welcoming splash screen AKA help guide
         self.render_welcome_screen()
         # Check notes preference and toggle open notes pane - important upon initial program launch
@@ -1333,106 +1485,339 @@ class QuranView:
             self.toggle_notes_pane()
    
     def render_welcome_screen(self):
-        """ Both the splash screen and the help screen (appears when double clicking in the Search Query field)"""        
+
+        """Both the splash screen and the help screen (appears when double clicking in the Search Query field)."""
         self.result_text.delete(1.0, tk.END)
 
         self.result_text.insert(tk.END, "\n")
         self.result_text.insert(tk.END, "Bismillah  ---  SalamunAlaykum", ("bold", "center"))
         self.result_text.insert(tk.END, "\n\n")
+
+        # Aggregated Translation Statistics
+        stats = self.controller.quran_model.get_translation_statistics()
+
+        total_trans = stats.get('total_translations', 0)
+        arabic = stats.get('arabic', {})
+        translit = stats.get('transliteration', {})
+        other = stats.get('other', {})
+
+        self.result_text.insert(tk.END, "Translation Summary\n", ("bold", "underline", "center"))
+        self.result_text.insert(tk.END, "=" * 40 + "\n\n")
+
+        self.result_text.insert(tk.END, f"Total translations available: {total_trans}\n\n")
+
+        self.result_text.insert(tk.END, "Arabic / Scriptual:\n", ("bold",))
+        self.result_text.insert(tk.END, f"  • Total: {arabic.get('total', 0)}\n")
+        self.result_text.insert(tk.END, f"  • Full (>=6235 verses): {arabic.get('full', 0)}\n")
+        self.result_text.insert(tk.END, f"  • Partial (missing verses): {arabic.get('partial', 0)}\n\n")
+
+        self.result_text.insert(tk.END, "Transliterations:\n", ("bold",))
+        self.result_text.insert(tk.END, f"  • Total: {translit.get('total', 0)}\n")
+        self.result_text.insert(tk.END, f"  • Full (>=6235 verses): {translit.get('full', 0)}\n")
+        self.result_text.insert(tk.END, f"  • Partial (missing verses): {translit.get('partial', 0)}\n\n")
+
+        self.result_text.insert(tk.END, "English / Other Languages:\n", ("bold",))
+        self.result_text.insert(tk.END, f"  • Total: {other.get('total', 0)}\n")
+        self.result_text.insert(tk.END, f"  • Full (>=6235 verses): {other.get('full', 0)}\n")
+        self.result_text.insert(tk.END, f"  • Partial (missing verses): {other.get('partial', 0)}\n\n")
+
         self.result_text.insert(tk.END, "Click the  ", ("bold", "center"))
         self.result_text.insert(tk.END, "Show Verses", ("border", "bold", "center"))
         self.result_text.insert(tk.END, "  button above\n\n", ("bold", "center"))
 
         self.result_text.insert(tk.END, "General Use Tips:\n\n", ("bold", "underline"))
-        self.result_text.insert(tk.END, "• Read this more easily by choosing a font & size to your liking\n")
-        self.result_text.insert(tk.END, "  .. try 'Leelawadee UI' if using MS Windows\n")
-        self.result_text.insert(tk.END, "  .. mouse over the 'Size' and scroll with mouse wheel to dynamically change it\n\n")
-        self.result_text.insert(tk.END, "• Enable the ")
-        self.result_text.insert(tk.END, "' Tips '", "bold")
-        self.result_text.insert(tk.END, " checkbox and hold mouse over items for interactive help\n\n")
-        self.result_text.insert(tk.END, "• Return to this help guide by double clicking inside the 'Search Query' field\n\n")
+        self.insert_help_and_tips(self.result_text)
 
-        self.result_text.insert(tk.END, "Search Tips:\n\n", ("bold", "underline"))
+    def insert_help_and_tips(self, text_widget):
+        """Inserts general-use and search tips into a Text widget."""
+        text_widget.insert(tk.END, "• Read this more easily by choosing a font & size to your liking\n")
+        text_widget.insert(tk.END, "  .. try 'Leelawadee UI' if using MS Windows\n")
+        text_widget.insert(tk.END, "  .. mouse over the 'Size' and scroll with mouse wheel to dynamically change it\n\n")
+        text_widget.insert(tk.END, "• Enable the 'Tips' checkbox in Settings and hold mouse over items for interactive help\n\n")
+        text_widget.insert(tk.END, "• Return to this help guide by double clicking inside the 'Search Query' field\n\n")
 
-        self.result_text.insert(tk.END, "• Pressing ")
-        self.result_text.insert(tk.END, "Enter", "bold")
-        self.result_text.insert(tk.END, " is equivalent to clicking 'Show Verses'\n\n")
+        text_widget.insert(tk.END, "• All searches are ")
+        text_widget.insert(tk.END, "CaSe-INsensitive\n\n", "bold")
 
-        self.result_text.insert(tk.END, "• All searches are ")
-        self.result_text.insert(tk.END, "CaSe-INsensitive\n\n", "bold")
+        text_widget.insert(tk.END, "• The order of terms does ")
+        text_widget.insert(tk.END, "not", "bold")
+        text_widget.insert(tk.END, " matter: (crescent moons = moons crescent)\n")
+        text_widget.insert(tk.END, "  .. if order is important, then use ")
+        text_widget.insert(tk.END, "\"quotes\"", "bold")
+        text_widget.insert(tk.END, " to find an exact phrase (e.g., \"upon his sons\")\n\n")
+        text_widget.insert(tk.END, "• Surrounding the search term in ")
+        text_widget.insert(tk.END, "\"quotes\"", "bold")
+        text_widget.insert(tk.END, " includes the 'space' character in the search\n")
+        text_widget.insert(tk.END, "  .. \"ent m\" finds: s")
+        text_widget.insert(tk.END, "ent m", "bold")
+        text_widget.insert(tk.END, "essengers & cresc")
+        text_widget.insert(tk.END, "ent m", "bold")
+        text_widget.insert(tk.END, "oons\n")
+        text_widget.insert(tk.END, "  .. each of these 5 examples gives unique results: \" here\" / \" here \" / \"here \" / \"here\" / here (without quotes)\n\n")
 
-        self.result_text.insert(tk.END, "• The order of terms does ")
-        self.result_text.insert(tk.END, "not", "bold")
-        self.result_text.insert(tk.END, " matter: (crescent moons = moons crescent)\n")
-        self.result_text.insert(tk.END, "  .. if order is important, then use ")
-        self.result_text.insert(tk.END, "\"quotes\"", "bold")
-        self.result_text.insert(tk.END, " to find an exact phrase (e.g., \"upon his sons\")\n\n")
-        self.result_text.insert(tk.END, "• Surrounding the search term in ")
-        self.result_text.insert(tk.END, "\"quotes\"", "bold")
-        self.result_text.insert(tk.END, " includes the 'space' character in the search\n")
-        self.result_text.insert(tk.END, "  .. \"ent m\" finds: s")
-        self.result_text.insert(tk.END, "ent m", "bold")
-        self.result_text.insert(tk.END, "essengers & cresc")
-        self.result_text.insert(tk.END, "ent m", "bold")
-        self.result_text.insert(tk.END, "oons\n")
-        self.result_text.insert(tk.END, "  .. each of these 5 examples gives unique results: \" here\" / \" here \" / \"here \" / \"here\" / here (without quotes)\n\n")
+        text_widget.insert(tk.END, "• ")
+        text_widget.insert(tk.END, " ' * ' ", "bold")
+        text_widget.insert(tk.END, " = multi-character wildcard - ' ")
+        text_widget.insert(tk.END, "*after", "bold")
+        text_widget.insert(tk.END, " ' will find: HEREafter\n")
+        text_widget.insert(tk.END, "  .. wildcard is ")
+        text_widget.insert(tk.END, "not ", "bold")
+        text_widget.insert(tk.END, "required on term endings (' test ' will find: testED)\n\n")
 
-        self.result_text.insert(tk.END, "• ")
-        self.result_text.insert(tk.END, " ' * ' ", "bold")
-        self.result_text.insert(tk.END, " = multi-character wildcard - ' ")
-        self.result_text.insert(tk.END, "*after", "bold")
-        self.result_text.insert(tk.END, " ' will find: HEREafter\n")
-        self.result_text.insert(tk.END, "  .. wildcard is ")
-        self.result_text.insert(tk.END, "not ", "bold")
-        self.result_text.insert(tk.END, "required on term endings (' test ' will find: testED)\n\n")
+        text_widget.insert(tk.END, "• ")
+        text_widget.insert(tk.END, " ' ? '", "bold")
+        text_widget.insert(tk.END, " = single character wildcard\n .. ")
+        text_widget.insert(tk.END, "' m?ha '", "bold")
+        text_widget.insert(tk.END, " finds both: MUhammad & MOhamed\n\n")
 
-        self.result_text.insert(tk.END, "• ")
-        self.result_text.insert(tk.END, " ' ? '", "bold")
-        self.result_text.insert(tk.END, " = single character wildcard\n .. ")
-        self.result_text.insert(tk.END, "' m?ha '", "bold")
-        self.result_text.insert(tk.END, " finds both: MUhammad & MOhamed\n\n")
+        text_widget.insert(tk.END, "• Wildcards may be combined - ")
+        text_widget.insert(tk.END, " ' ?brah*m ' ", "bold")
+        text_widget.insert(tk.END, " finds both: AbrahAm & IbrahEEm\n\n")
 
-        self.result_text.insert(tk.END, "• Wildcards may be combined - ")
-        self.result_text.insert(tk.END, " ' ?brah*m ' ", "bold")
-        self.result_text.insert(tk.END, " finds both: AbrahAm & IbrahEEm\n\n")
+        text_widget.insert(tk.END, "• Broad Search\n", "bold")
+        text_widget.insert(tk.END, "  .. When disabled, looks only inside the selected translation(s) for your query\n")
+        text_widget.insert(tk.END, "  .. When enabled, looks in all translations, but only your selected translation(s) are displayed\n")
+        text_widget.insert(tk.END, "  .. Search is nearly instantaneous when disabled; slow when enabled\n")
+        text_widget.insert(tk.END, "  .. Useful because Arabic words get translated into various synonymous English words by different translators\n\n")
+        text_widget.insert(tk.END, "• Broad Results\n", "bold")
+        text_widget.insert(tk.END, "  .. Adds all translations matching the query irrespective of selected translation(s)\n\n")
 
-        self.result_text.insert(tk.END, "• Broad Search\n", "bold")
-        self.result_text.insert(tk.END, "  .. When disabled, looks only inside the selected translation(s) for your query\n")
-        self.result_text.insert(tk.END, "  .. When enabled, looks in all translations, but only your selected translation(s) are displayed\n")
-        self.result_text.insert(tk.END, "  .. Search is nearly instantaneous when disabled; slow when enabled\n")
-        self.result_text.insert(tk.END, "  .. Useful because Arabic words get translated into various synonymous English words by different translators\n\n")
-        self.result_text.insert(tk.END, "• Broad Results\n", "bold")
-        self.result_text.insert(tk.END, "  .. Adds all translations matching the query irrespective of selected translation(s)\n\n")
+        text_widget.insert(tk.END, "Training Example:\n", ("bold", "underline"))
+        text_widget.insert(tk.END, " 1) Select these 2 translators only: 'Abdel Haleem' & 'Abdul Hye'\n")
+        text_widget.insert(tk.END, " 2) Set surah.verse-range to ")
+        text_widget.insert(tk.END, "'1-114'", "bold")
+        text_widget.insert(tk.END, " (The entire Quran)\n")
+        text_widget.insert(tk.END, " 3) Disable 'Broad Search'\n")
+        text_widget.insert(tk.END, " 4) Search for the keyword:  ")
+        text_widget.insert(tk.END, "hive", ("bold"))
+        text_widget.insert(tk.END, "\n")
+        text_widget.insert(tk.END, " 5) You will see:  'No verses match the search criteria'\n")
+        text_widget.insert(tk.END, " 6) Enable 'Broad Search' but leave 'Broad Results' disabled\n")
+        text_widget.insert(tk.END, " 7) Now it finds 1 verse, and displays it for the 2 selected translations\n")
+        text_widget.insert(tk.END, " 8) Notice that 'hive' does not appear in the results, as Abdel Haleem used 'houses' & Abdul Hye used 'habitations'\n")
+        text_widget.insert(tk.END, " 9) Next, enable: ")
+        text_widget.insert(tk.END, "'Broad Results'",("bold"))
+        text_widget.insert(tk.END, "\n")
+        text_widget.insert(tk.END, " 10) An additional 26 translations are shown; all those containing the word 'hive'\n")
+        text_widget.insert(tk.END, " 11) Notice the status bar reports: 'Found 1 verse in 2+26 translations'\n\n")
 
-        self.result_text.insert(tk.END, "Training Example:\n", ("bold", "underline"))
-        self.result_text.insert(tk.END, " 1) Select these 2 translators only: 'Abdel Haleem' & 'Abdul Hye'\n")
-        self.result_text.insert(tk.END, " 2) Set surah.verse-range to ")
-        self.result_text.insert(tk.END, "'1-114'", "bold")
-        self.result_text.insert(tk.END, " (The entire Quran)\n")
-        self.result_text.insert(tk.END, " 3) Disable 'Broad Search'\n")
-        self.result_text.insert(tk.END, " 4) Search for the keyword:  ")
-        self.result_text.insert(tk.END, "hive", ("bold"))
-        self.result_text.insert(tk.END, "\n")
-        self.result_text.insert(tk.END, " 5) You will see:  'No verses match the search criteria'\n")
-        self.result_text.insert(tk.END, " 6) Enable 'Broad Search' but leave 'Broad Results' disabled\n")
-        self.result_text.insert(tk.END, " 7) Now it finds 1 verse, and displays it for the 2 selected translations\n")
-        self.result_text.insert(tk.END, " 8) Notice that 'hive' does not appear in the results, as Abdel Haleem used 'houses' & Abdul Hye used 'habitations'\n")
-        self.result_text.insert(tk.END, " 9) Next, enable: ")
-        self.result_text.insert(tk.END, "'Broad Results'",("bold"))
-        self.result_text.insert(tk.END, "\n")
-        self.result_text.insert(tk.END, " 10) An additional 26 translations are shown; all those containing the word 'hive'\n")
-        self.result_text.insert(tk.END, " 11) Notice the status bar reports: 'Found 1 verse in 2+26 translations'\n\n")
+        text_widget.insert(tk.END, "code base 960\n", "right")
+        text_widget.insert(tk.END, "June 2026\n", "right")
+        text_widget.insert(tk.END, "reez@hotmail.com\n", "right")
+        text_widget.insert(tk.END, "https://github.com/reez79/IslamAwakened_XML", "right")
 
-        self.result_text.insert(tk.END, "code base 960\n", "right")
-        self.result_text.insert(tk.END, "June 2026\n", "right")
-        self.result_text.insert(tk.END, "reez@hotmail.com\n", "right")
-        self.result_text.insert(tk.END, "https://github.com/reez79/IslamAwakened_XML", "right")
+    def show_surah_reference_popup(self):
+        """Displays a popup listing all surah numbers with Arabic and English names."""
+        colors = self.controller.theme_model.get_colors()
+        popup = tk.Toplevel(self.root)
+        popup.title("Surah Reference")
+        popup.configure(bg=colors['bg'])
+        # Wider popup for readability
+        popup.geometry("720x600")
 
-        self.status_var.set("Ready - Click the 'Show Verses' button")
+        list_frame = tk.Frame(popup, bg=colors['bg'])
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient='vertical')
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        text = tk.Text(list_frame, bg=colors['entry_bg'], fg=colors['fg'], wrap=tk.NONE,
+                       cursor="arrow", padx=18, pady=6)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.configure(command=text.yview)
+
+        def _luminance(hex_color):
+            h = str(hex_color).lstrip('#')
+            if len(h) != 6:
+                return 0.5
+            try:
+                r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            except ValueError:
+                return 0.5
+            return (0.299 * r + 0.587 * g + 0.114 * b) / 255
+
+        # Chip behind the number so it stays readable on dark or light themes
+        if _luminance(colors.get('entry_bg', '#000000')) < 0.45:
+            link_bg, link_fg = "#e8e8e8", "#111111"
+        else:
+            link_bg, link_fg = "#222222", "#ffffff"
+
+        try:
+            link_size = max(14, int(self.current_font_size.get()) + 4)
+        except (TypeError, ValueError):
+            link_size = 15
+        text.tag_configure(
+            "surah_link",
+            foreground=link_fg,
+            background=link_bg,
+            underline=False,
+            font=(self.current_font.get(), link_size, "bold"),
+        )
+        text.tag_raise("surah_link")
+
+        def jump_to_surah(surah_num, event=None):
+            popup.destroy()
+            self.last_reference.set(str(surah_num))
+            self.trigger_search()
+
+        def bind_link_cursor(tag_name):
+            text.tag_bind(tag_name, "<Enter>", lambda e: text.config(cursor="hand2"))
+            text.tag_bind(tag_name, "<Leave>", lambda e: text.config(cursor="arrow"))
+
+        def insert_surah_link(surah_num):
+            tag_name = f"surah_link_{surah_num}"
+            # Leading gutter + padded digits stay inside the tag so the click target is larger
+            text.insert(tk.END, f"  {str(surah_num):>3}  ", (tag_name, "surah_link"))
+            text.tag_bind(tag_name, "<Button-1>", lambda e, s=surah_num: jump_to_surah(s))
+            bind_link_cursor(tag_name)
+
+        # Populate with surah info
+        try:
+            for key in sorted(self.controller.quran_model.surah_names.keys(), key=lambda x: int(x)):
+                arabic_name, translit, english = self.controller.quran_model.surah_names.get(key, ('', '', ''))
+                ayah_count = self.controller.quran_model.ayah_counts.get(key, '')
+                insert_surah_link(key)
+                text.insert(tk.END, f" | {translit} | {english} | {ayah_count} | {arabic_name}\n")
+        except Exception:
+            # Fallback: if surah_names not populated yet
+            for i in range(1, 115):
+                insert_surah_link(str(i))
+                text.insert(tk.END, f". Surah {i}\n")
+
+        text.configure(state=tk.DISABLED)
+
+        def on_close(event=None):
+            popup.destroy()
+
+        popup.bind('<Escape>', lambda e: on_close())
+        # Focus so ESC works immediately
+        popup.focus_set()
+
+    def open_settings_dialog(self):
+        """Opens a settings dialog containing font, size, theme, customize and tips controls."""
+        colors = self.controller.theme_model.get_colors()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Settings")
+        dlg.geometry("420x320")
+        dlg.configure(bg=colors['bg'])
+
+        frame = tk.Frame(dlg, bg=colors['bg'])
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Font
+        tk.Label(frame, text="Font:", bg=colors['bg'], fg=colors['fg']).grid(row=0, column=0, sticky='w')
+        font_combo = ttk.Combobox(frame, values=self.available_fonts, state='readonly', width=30)
+        font_combo.set(self.current_font.get())
+        font_combo.grid(row=0, column=1, sticky='w', padx=8)
+
+        # Size
+        tk.Label(frame, text="Size:", bg=colors['bg'], fg=colors['fg']).grid(row=1, column=0, sticky='w')
+        size_combo = ttk.Combobox(frame, values=self.font_sizes, state='readonly', width=8)
+        size_combo.set(self.current_font_size.get())
+        size_combo.grid(row=1, column=1, sticky='w', padx=8)
+
+        # Theme
+        tk.Label(frame, text="Theme:", bg=colors['bg'], fg=colors['fg']).grid(row=2, column=0, sticky='w')
+        theme_combo = ttk.Combobox(frame, values=list(self.controller.theme_model.themes.keys()), state='readonly', width=20)
+        theme_combo.set(self.theme_var.get())
+        theme_combo.grid(row=2, column=1, sticky='w', padx=8)
+
+        # Customize button
+        customize_btn = tk.Button(frame, text='Customize', command=self.open_custom_theme_editor, bg=colors['button_bg'], fg=colors['button_fg'])
+        customize_btn.grid(row=2, column=2, padx=8)
+
+        # Toggle items stacked in one column
+        tips_var = tk.BooleanVar(value=self.tooltips_var.get())
+        tips_cb = tk.Checkbutton(frame, text='Tips', variable=tips_var, bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'])
+        tips_cb.grid(row=3, column=0, columnspan=3, sticky='w', pady=4)
+
+        random_var = tk.BooleanVar(value=self.random_verse_var.get())
+        random_cb = tk.Checkbutton(frame, text='Random translation colors', variable=random_var, bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'])
+        random_cb.grid(row=4, column=0, columnspan=3, sticky='w', pady=4)
+
+        reading_var = tk.BooleanVar(value=self.reading_mode_var.get() if hasattr(self, 'reading_mode_var') else False)
+        reading_cb = tk.Checkbutton(frame, text='Reading mode (text only)', variable=reading_var, bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'])
+        reading_cb.grid(row=5, column=0, columnspan=3, sticky='w', pady=4)
+
+        def apply_settings():
+            # Apply font and size
+            chosen_font = font_combo.get()
+            chosen_size = size_combo.get()
+            if chosen_font:
+                self.current_font.set(chosen_font)
+            if chosen_size:
+                self.current_font_size.set(chosen_size)
+            # Theme
+            chosen_theme = theme_combo.get()
+            if chosen_theme:
+                self.theme_var.set(chosen_theme)
+                self.apply_visual_theme()
+            # Tips
+            self.tooltips_var.set(tips_var.get())
+            # Random translation colors
+            self.random_verse_var.set(random_var.get())
+            # Reading mode
+            if not hasattr(self, 'reading_mode_var'):
+                self.reading_mode_var = tk.BooleanVar(value=reading_var.get())
+            else:
+                self.reading_mode_var.set(reading_var.get())
+            # Persist these preferences
+            try:
+                self.controller.prefs_model.data['random_verse_colors'] = bool(self.random_verse_var.get())
+                self.controller.prefs_model.data['reading_mode'] = bool(self.reading_mode_var.get())
+                self.controller.prefs_model.save_preferences()
+            except Exception:
+                logging.exception('Failed to save preferences from Settings')
+            # Re-apply font settings and translator colors
+            self.update_active_font()
+            self.update_translation_checkbox_colors()
+            dlg.destroy()
+            # Refresh displayed verses so color/reading-mode changes take effect
+            current = self.result_text.get("1.0", "3.0")
+            if "Bismillah" not in current:
+                self.trigger_search()
+
+        btn_frame = tk.Frame(dlg, bg=colors['bg'])
+        btn_frame.pack(fill=tk.X, pady=6)
+        tk.Button(btn_frame, text='Apply', command=apply_settings, bg=colors['button_bg'], fg=colors['button_fg']).pack(side=tk.RIGHT, padx=8)
+        tk.Button(btn_frame, text='Cancel', command=dlg.destroy, bg=colors['button_bg'], fg=colors['button_fg']).pack(side=tk.RIGHT)
+        help_btn = tk.Button(btn_frame, text='Help', command=self.show_help_popup, bg=colors['button_bg'], fg=colors['button_fg'])
+        help_btn.pack(side=tk.LEFT, padx=8)
 
     def toggle_broad_results_interactive(self, *args):
         state = "normal" if self.broad_search_var.get() else "disabled"
         self.broad_results_cb.configure(state=state)
+
+    def toggle_sidebar(self):
+        """Opens or closes the left translations sidebar."""
+        if getattr(self, 'sidebar_visible', True):
+            try:
+                self.main_container.forget(self.left_frame)
+            except Exception:
+                pass
+            self.sidebar_visible = False
+            self.sidebar_toggle_btn.configure(text='▶')
+        else:
+            try:
+                # Reorder panes so left_frame is restored to the left side
+                try:
+                    self.main_container.forget(self.right_frame)
+                except Exception:
+                    pass
+                self.main_container.add(self.left_frame, width=DEFAULT_SASH_POSITION)
+                try:
+                    self.main_container.add(self.right_frame)
+                except Exception:
+                    pass
+            except Exception:
+                # Fallback: simple add
+                try:
+                    self.main_container.add(self.left_frame, width=DEFAULT_SASH_POSITION)
+                except Exception:
+                    pass
+            self.sidebar_visible = True
+            self.sidebar_toggle_btn.configure(text='☰')
 
     def on_canvas_mousewheel(self, event):
         """Standardized wheel interaction for list checklist bounds."""
@@ -1450,13 +1835,58 @@ class QuranView:
     def filter_translations(self, *args):
         """Filters scrollable checkbox list search matches interactively."""
         search_text = self.filter_var.get().lower()
+        show_selected_only = getattr(self, 'show_selected_translators_only', False)
         for i, trans in enumerate(self.controller.quran_model.translations):
             cb = self.translation_checkbuttons[trans]
-            if search_text in trans.lower():
+            matches_filter = search_text in trans.lower()
+            matches_selection = (not show_selected_only) or self.translation_vars[trans].get()
+            if matches_filter and matches_selection:
                 cb.grid(row=i, column=0, sticky="w", padx=2, pady=0)
             else:
                 cb.grid_forget()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def toggle_translator_visibility(self):
+        """Toggles translator list between all names and only selected names."""
+        self.show_selected_translators_only = not getattr(self, 'show_selected_translators_only', False)
+        if self.show_selected_translators_only:
+            self.eye_btn.configure(relief=tk.SUNKEN)
+            self.status_var.set("Showing selected translators only")
+        else:
+            self.eye_btn.configure(relief=tk.RAISED)
+            self.status_var.set("Showing all translators")
+        self.filter_translations()
+
+    def on_translation_toggled(self):
+        """Keeps the selected-only list in sync when a checkbox changes."""
+        if getattr(self, 'show_selected_translators_only', False):
+            self.filter_translations()
+        self.trigger_search()
+
+    def update_translation_checkbox_colors(self):
+        """Applies per-translator colors when the color toggle is on; otherwise one theme color."""
+        colors = self.controller.theme_model.get_colors()
+        trans_colors = self.controller.prefs_model.data.get('translation_colors', {})
+        use_colors = bool(self.random_verse_var.get())
+        for trans, cb in self.translation_checkbuttons.items():
+            fg = trans_colors.get(trans, colors['fg']) if use_colors else colors['fg']
+            cb.configure(bg=colors['bg'], fg=fg, selectcolor=colors['selectbg'])
+
+    def toggle_select_all(self):
+        """Toggles selection of all translations (select all / clear all)."""
+        self.select_all_state = not getattr(self, 'select_all_state', False)
+        if self.select_all_state:
+            for var in self.translation_vars.values():
+                var.set(True)
+            self.select_all_btn.configure(text='None')
+            self.status_var.set("All translations selected")
+        else:
+            for var in self.translation_vars.values():
+                var.set(False)
+            self.select_all_btn.configure(text='All')
+            self.status_var.set("All translations cleared")
+        self.filter_translations()
+        self.trigger_search()
 
     def setup_text_tags(self):
         """Formats layout, spacing, colors and fonts of nested text views."""
@@ -1472,6 +1902,17 @@ class QuranView:
         self.result_text.tag_configure("arabic_space", spacing3=3)
         self.result_text.tag_configure("english_space", spacing3=1)
         self.result_text.tag_configure("header_space", spacing1=12)
+        
+        # HTML formatting tags
+        self.result_text.tag_configure("html_b", font=(self.current_font.get(), int(self.current_font_size.get()), "bold"))
+        self.result_text.tag_configure("html_i", font=(self.current_font.get(), int(self.current_font_size.get()), "italic"))
+        self.result_text.tag_configure("html_u", underline=True)
+
+        # Create tags for each translation color (if preferences available)
+        trans_colors = self.controller.prefs_model.data.get('translation_colors', {})
+        for trans, color in trans_colors.items():
+            safe = re.sub(r'[^0-9a-zA-Z_]','_', trans)
+            self.result_text.tag_configure(f"trans_{safe}", foreground=color)
 
     def open_custom_theme_editor(self):
         """Launches detached, decoupled Toplevel window for custom color curation."""
@@ -1543,8 +1984,7 @@ class QuranView:
         self.font_frame.configure(bg=colors['bg'])
         self.result_frame.configure(bg=colors['bg'])
 
-        for cb in self.translation_checkbuttons.values():
-            cb.configure(bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'])
+        self.update_translation_checkbox_colors()
         self.broad_search_cb.configure(bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'])
         self.broad_results_cb.configure(bg=colors['bg'], fg=colors['fg'], selectcolor=colors['selectbg'])
 
@@ -1620,6 +2060,26 @@ class QuranView:
                 new_ref = f"{surah_start}.{start_ayah}"
                 self.last_reference.set(new_ref)
                 self.trigger_search(from_navigation=True)
+        except ValueError:
+            pass
+
+    def navigate_first(self):
+        """Go to the first verse in the selected range."""
+        try:
+            surah_start, start_ayah, surah_end, end_ayah = self.controller.parse_reference(self.ref_entry.get())
+            new_ref = f"{surah_start}.{start_ayah}"
+            self.last_reference.set(new_ref)
+            self.trigger_search(from_navigation=True)
+        except ValueError:
+            pass
+
+    def navigate_last(self):
+        """Go to the last verse in the selected range."""
+        try:
+            surah_start, start_ayah, surah_end, end_ayah = self.controller.parse_reference(self.ref_entry.get())
+            new_ref = f"{surah_end}.{end_ayah}"
+            self.last_reference.set(new_ref)
+            self.trigger_search(from_navigation=True)
         except ValueError:
             pass
 
@@ -1738,23 +2198,81 @@ class QuranView:
             
             self.trigger_search()
 
+    def add_new_preset(self):
+        """Creates a dialog to add a new preset with current selections."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add New Preset")
+        dialog.geometry("300x100")
+        dialog.resizable(False, False)
+        
+        colors = self.controller.theme_model.get_colors()
+        dialog.configure(bg=colors['bg'])
+        
+        tk.Label(dialog, text="Preset Name:", bg=colors['bg'], fg=colors['fg']).pack(pady=5)
+        name_entry = tk.Entry(dialog, bg=colors['entry_bg'], fg=colors['fg'], insertbackground=colors['fg'])
+        name_entry.pack(pady=5, padx=10, fill=tk.X)
+        name_entry.focus()
+        
+        def save_new():
+            preset_name = name_entry.get().strip()
+            if not preset_name:
+                messagebox.showwarning("Invalid Name", "Please enter a preset name")
+                return
+            if preset_name in self.controller.prefs_model.get_preset_names():
+                messagebox.showwarning("Duplicate", "A preset with this name already exists")
+                return
+            
+            selected = [trans for trans, var in self.translation_vars.items() if var.get()]
+            self.controller.prefs_model.save_preset(preset_name, selected)
+            self.preset_var.set(preset_name)
+            self.preset_combo['values'] = self.controller.prefs_model.get_preset_names()
+            self.status_var.set(f"Saved preset '{preset_name}'")
+            dialog.destroy()
+        
+        tk.Button(dialog, text="Save", command=save_new, bg=colors['button_bg'], fg=colors['button_fg']).pack(pady=5)
+
+
+    def load_preset_from_dropdown(self, event=None):
+        """Loads the selected preset from dropdown."""
+        preset_name = self.preset_var.get()
+        preset_translations = self.controller.prefs_model.get_preset(preset_name)
+        if preset_translations:
+            for trans, var in self.translation_vars.items():
+                var.set(trans in preset_translations)
+            self.filter_translations()
+            self.trigger_search()
+            self.status_var.set(f"Loaded preset '{preset_name}'")
+
+    def delete_current_preset(self):
+        """Deletes the currently selected preset and moves to the next available preset."""
+        preset_name = self.preset_var.get()
+        if preset_name == "Default":
+            messagebox.showwarning("Cannot Delete", "Cannot delete the Default preset")
+            return
+        
+        if messagebox.askyesno("Delete Preset", f"Delete preset '{preset_name}'?"):
+            # Delete and refresh dropdown values
+            names = self.controller.prefs_model.get_preset_names()
+            self.controller.prefs_model.delete_preset(preset_name)
+            remaining_presets = self.controller.prefs_model.get_preset_names()
+            self.preset_combo['values'] = remaining_presets
+            # Move selection to next if available
+            if remaining_presets:
+                next_name = remaining_presets[0]
+                self.preset_var.set(next_name)
+                # Load that preset selections
+                self.load_preset_from_dropdown()
+            else:
+                self.preset_var.set('Default')
+            self.status_var.set(f"Deleted preset '{preset_name}'")
+
     def save_favorites_preset(self):
-        """Saves current selected translations to favorites key in preferences."""
-        prefs = self.controller.prefs_model.data
-        prefs['favorite_translations'] = [trans for trans, var in self.translation_vars.items() if var.get()]
-        self.controller.prefs_model.save_preferences()
-        self.status_var.set("Saved current translations to favorites")
+        """Legacy method - redirects to add_new_preset for backwards compatibility."""
+        self.add_new_preset()
 
     def load_favorites_preset(self):
-        """Loads favorite translations from preferences, updates checkboxes, and triggers search."""
-        favs = self.controller.prefs_model.data.get('favorite_translations', [])
-        if not favs:
-            self.status_var.set("No saved favorites found")
-            return
-        for trans, var in self.translation_vars.items():
-            var.set(trans in favs)
-        self.trigger_search()
-        self.status_var.set("Loaded saved translation favorites")
+        """Legacy method - loads Default preset for backwards compatibility."""
+        self.load_preset_from_dropdown()
 
     def select_all_translations(self):
         """Selects all translation checkboxes and triggers search."""
@@ -1771,11 +2289,41 @@ class QuranView:
         self.status_var.set("All translations cleared")
 
     def show_search_tips(self, event=None):
-        """Displays search tips in the results window."""
-        self.render_welcome_screen()
-        self.status_var.set("Showing search tips.")
+        """Open a Help popup (previously inserted into the results area)."""
+        self.show_help_popup()
+        self.status_var.set("Showing help dialog.")
 
-    def trigger_search(self, event=None, from_notes=False, from_navigation=False):
+    def show_help_popup(self):
+        colors = self.controller.theme_model.get_colors()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Help & Search Tips")
+        dlg.geometry("720x520")
+        dlg.configure(bg=colors['bg'])
+
+        text_frame = tk.Frame(dlg, bg=colors['bg'])
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        scrollbar = ttk.Scrollbar(text_frame, orient='vertical')
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        help_text = tk.Text(text_frame, wrap=tk.WORD, bg=colors['entry_bg'], fg=colors['fg'],
+                            font=(self.current_font.get(), int(self.current_font_size.get())))
+        help_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        help_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.configure(command=help_text.yview)
+        help_text.tag_configure("bold", font=(self.current_font.get(), int(self.current_font_size.get()), "bold"))
+        help_text.tag_configure("underline", underline=True)
+        help_text.tag_configure("right", justify="right")
+
+        self.insert_help_and_tips(help_text)
+        help_text.configure(state=tk.DISABLED)
+
+        def close_dlg(event=None):
+            dlg.destroy()
+        dlg.bind('<Escape>', lambda e: close_dlg())
+        dlg.focus_set()
+
+    def trigger_search(self, event=None, from_notes=False, from_navigation=False, lazy_offset=0):
         """Invokes search from user actions, formatting text outputs in view cleanly."""
         if self.notes_var.get() and not from_navigation and not from_notes:
             ref_val = self.ref_entry.get().strip()
@@ -1840,27 +2388,177 @@ class QuranView:
             return
 
         # Populate structured output
-        for v in verses:
-            # FIX: If there is no translation text to display, skip the header entirely
+        trans_colors = self.controller.prefs_model.data.get('translation_colors', {})
+        verse_index = 0
+        random_palette = [
+            "#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", "#98D8C8",
+            "#F7DC6F", "#BB8FCE", "#85C1E2", "#F8B88B", "#52C9D9",
+            "#F06292", "#AB47BC", "#29B6F6", "#26C6DA", "#66BB6A",
+            "#FFA726", "#EF5350", "#7E57C2", "#5C6BC0", "#42A5F5"
+        ]
+
+        # Detect full-Quran selection for lazy loading
+        full_quran_selected = False
+        try:
+            s_s, a_s, s_e, a_e = self.controller.parse_reference(ref_val)
+            if s_s == '1' and s_e == '114' and a_s == '1':
+                full_quran_selected = True
+        except Exception:
+            full_quran_selected = False
+
+        # Lazy loading when whole quran selected and multiple translations chosen
+        verses_to_display = verses
+        total_verses_count = len(verses)
+        if full_quran_selected and len(selected_translations) > 1:
+            batch = getattr(self, 'lazy_batch_size', 500)
+            # first time set batch size and offset
+            if lazy_offset == 0:
+                self.lazy_batch_size = batch
+                self.lazy_offset = 0
+            start = lazy_offset
+            end = min(start + batch, total_verses_count)
+            verses_to_display = verses[start:end]
+            loading_more_expected = end < total_verses_count
+        else:
+            loading_more_expected = False
+
+        # When color toggle is on, each translator keeps a distinct color.
+        # When off, every translator and verse uses the same theme text color.
+        trans_colors_pref = self.controller.prefs_model.data.get('translation_colors', {})
+        theme_fg = self.controller.theme_model.get_colors()['fg']
+        effective_trans_colors = {}
+        transs_in_results = set()
+        for vv in verses_to_display:
+            transs_in_results.update(vv.get('texts', {}).keys())
+        targets = sorted(list(transs_in_results))
+        if self.random_verse_var.get():
+            for i, trans in enumerate(targets):
+                effective_trans_colors[trans] = trans_colors_pref.get(trans, random_palette[i % len(random_palette)])
+        else:
+            for trans in targets:
+                effective_trans_colors[trans] = theme_fg
+
+        # Ensure tags for translations are configured with effective colors
+        effective_trans_tags = {}
+        for trans, color in effective_trans_colors.items():
+            safe = re.sub(r'[^0-9a-zA-Z_]','_', trans)
+            tagname = f"trans_{safe}"
+            effective_trans_tags[trans] = tagname
+            try:
+                self.result_text.tag_configure(tagname, foreground=color)
+            except Exception:
+                pass
+
+        def render_html_to_text(content, base_tags=(), allow_inline_color=True):
+            """Lightweight HTML renderer supporting b/i/u/span style=color and br."""
+            class _Parser(HTMLParser):
+                def __init__(self, widget, base_tags):
+                    super().__init__()
+                    self.widget = widget
+                    self.base_tags = list(base_tags)
+                    self.stack = []
+                def handle_starttag(self, tag, attrs):
+                    attrs = dict(attrs)
+                    if tag in ("b", "strong"):
+                        self.stack.append('html_b')
+                    elif tag in ("i", "em"):
+                        self.stack.append('html_i')
+                    elif tag == 'u':
+                        self.stack.append('html_u')
+                    elif tag == 'br':
+                        self.widget.insert(tk.END, '\n', tuple(self.base_tags + [t for t in self.stack if t]))
+                    elif tag == 'span':
+                        style = attrs.get('style', '')
+                        m = re.search(r'color\s*:\s*([^;]+)', style) if allow_inline_color else None
+                        if m:
+                            color = m.group(1).strip()
+                            tagname = f"html_color_{re.sub(r'[^0-9a-zA-Z_]','_', color)}"
+                            try:
+                                self.widget.tag_configure(tagname, foreground=color)
+                            except Exception:
+                                pass
+                            self.stack.append(tagname)
+                        else:
+                            self.stack.append(None)
+                    else:
+                        self.stack.append(None)
+                def handle_endtag(self, tag):
+                    if self.stack:
+                        self.stack.pop()
+                def handle_data(self, data):
+                    tags = [t for t in self.stack if t]
+                    try:
+                        self.widget.insert(tk.END, data, tuple(self.base_tags) + tuple(tags))
+                    except Exception:
+                        self.widget.insert(tk.END, data)
+            p = _Parser(self.result_text, list(base_tags))
+            p.feed(content)
+
+        for idx, v in enumerate(verses_to_display):
+            # Skip if there is no translation text to display
             if not v['texts']:
                 continue
-                
-            self.result_text.insert(tk.END, f"Surah {v['surah_num']} - {v['arabic_name']} ({v['english_name']}): Ayah {v['ayah_num']}\n", "header_space")
-            
-            # Restored exact vertical line spacing layout from 930
-            added_spacing = "\n" if "Arabic" not in v['display_translations'] else ""
-            self.result_text.insert(tk.END, f"{'=' * 40}\n{added_spacing}")
-            
-            # Formatted text insertion
+
+            # Mark start index for this verse block
+            start_idx = self.result_text.index(tk.END)
+
+            # Insert header and separator unless reading mode is enabled
+            if not getattr(self, 'reading_mode_var', tk.BooleanVar(value=False)).get():
+                self.result_text.insert(tk.END, f"Surah {v['surah_num']} - {v['arabic_name']} ({v['english_name']}): Ayah {v['ayah_num']}\n", "header_space")
+
+                # Vertical separator
+                added_spacing = "\n" if "Arabic" not in v['display_translations'] else ""
+                self.result_text.insert(tk.END, f"{'=' * 40}\n{added_spacing}")
+            else:
+                # Reading mode: only a small spacing between verses
+                self.result_text.insert(tk.END, "\n")
+
+            # Insert translations for this verse
             for trans, text in v['texts'].items():
-                tags = ("arabic_rtl", "arabic_space") if trans == "Arabic" else ("english_space",) if trans != "User Notes" else ()
-                label = "" if trans == "Arabic" else f"{trans}:\n"
-                
                 if trans == "Arabic":
-                    self.result_text.insert(tk.END, f"{label}{text}", tags)
+                    # Arabic content may contain HTML markup; render it with arabic styling
+                    base_tags = ('arabic_rtl',)
+                    color_tag = effective_trans_tags.get(trans)
+                    if color_tag:
+                        base_tags = tuple(list(base_tags) + [color_tag])
+                    render_html_to_text(text, base_tags=base_tags, allow_inline_color=bool(self.random_verse_var.get()))
                     self.result_text.insert(tk.END, "\n\n", "english_space")
                 else:
-                    self.result_text.insert(tk.END, f"{label}{text}\n\n", tags)
+                    color_tag = effective_trans_tags.get(trans)
+                    ayah_total = self.controller.quran_model.ayah_counts.get(v['surah_num'], '')
+                    label = f"{trans} {v['surah_num']}:{v['ayah_num']} [{ayah_total}]:\n"
+                    # Only show labels when not in reading mode
+                    if not getattr(self, 'reading_mode_var', tk.BooleanVar(value=False)).get():
+                        if color_tag:
+                            self.result_text.insert(tk.END, label, color_tag)
+                        else:
+                            self.result_text.insert(tk.END, label)
+                    base_tags = (color_tag,) if color_tag else ()
+                    render_html_to_text(text, base_tags=base_tags, allow_inline_color=bool(self.random_verse_var.get()))
+                    self.result_text.insert(tk.END, "\n\n", "english_space")
+
+            # Mark end index (no per-verse random color tags anymore)
+            end_idx = self.result_text.index(tk.END)
+            verse_index += 1
+
+        # If lazy loading is active, show a 'Load more' button below the result pane
+        try:
+            if loading_more_expected:
+                # create or update button
+                if not hasattr(self, 'load_more_btn') or not self.load_more_btn.winfo_exists():
+                    self.load_more_btn = tk.Button(self.result_frame, text='Load more results',
+                                                   command=lambda: self.trigger_search(None, from_notes, from_navigation, lazy_offset=lazy_offset + self.lazy_batch_size),
+                                                   bg=self.controller.theme_model.get_colors()['button_bg'],
+                                                   fg=self.controller.theme_model.get_colors()['button_fg'])
+                    self.load_more_btn.grid(row=1, column=0, sticky='ew', padx=5, pady=4)
+                else:
+                    # update command
+                    self.load_more_btn.configure(command=lambda: self.trigger_search(None, from_notes, from_navigation, lazy_offset=lazy_offset + self.lazy_batch_size))
+            else:
+                if hasattr(self, 'load_more_btn') and self.load_more_btn.winfo_exists():
+                    self.load_more_btn.destroy()
+        except Exception:
+            pass
 
         # Update note text area if open
         if hasattr(self, 'notes_text') and self.notes_text and outcome['last_ref']:
